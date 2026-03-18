@@ -36,7 +36,7 @@ load_dotenv()
 #  Configuration  ← edit .env or set env vars
 # ─────────────────────────────────────────────
 
-GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "AIzaSyAd6wZmxDQ_B65-9pr35epY5iVHFqu6vfQ")
+GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "your_key_here")
 GEMINI_MODEL     = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # Path to Google service account JSON key file
