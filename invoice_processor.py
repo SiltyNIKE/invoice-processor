@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""
+invoice_processor.py
+--------------------
+Polls a Google Drive folder (InvoicesToProcess) for new invoice PDFs,
+extracts structured data via Gemini LLM, writes results to Google Sheets,
+renames + moves files in Google Drive.
+
+Setup: read SETUP.md before running.
+"""
+
+import json
+import logging
+import os
+import re
+import tempfile
+import time
+from datetime import datetime
+from pathlib import Path
+
+import pdfplumber
+import google.generativeai as genai
+from dotenv import load_dotenv
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+import io
+
+# ─────────────────────────────────────────────
+#  Load environment
+# ─────────────────────────────────────────────
+
+load_dotenv()
+
+# ─────────────────────────────────────────────
+#  Configuration  ← edit .env or set env vars
+# ─────────────────────────────────────────────
+
+GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "AIzaSyAd6wZmxDQ_B65-9pr35epY5iVHFqu6vfQ")
+GEMINI_MODEL     = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+# Path to Google service account JSON key file
+GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
+
+# Google Sheets spreadsheet ID  (from the URL: /d/<SPREADSHEET_ID>/edit)
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "YOUR_SPREADSHEET_ID_HERE")
+
+# Google Drive folder IDs
+FOLDER_TO_PROCESS = os.getenv("FOLDER_TO_PROCESS", "1YIUagn9cyzHZejCAVX6LYjaTKyO6GCa9")
+FOLDER_EXTRACTED  = os.getenv("FOLDER_EXTRACTED",  "108tJWt8pb83ESdtwYSqtSZVtS11weV4F")
+FOLDER_ERRORS     = os.getenv("FOLDER_ERRORS",     "1JClebDM8_cBGXsuuJlTTmSSCnrDH6fkd")
+
+# How often to check for new files (seconds)
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
+
+# Local file to persist IDs of already-processed Drive files
+PROCESSED_IDS_FILE = Path(__file__).parent / "processed_ids.json"
+
+# Google API scopes
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
+
+# Company-type suffixes to remove from supplier name (order: longest first)
+COMPANY_SUFFIXES = [
+    r"\s*,?\s*š\.\s*p\.",
+    r"\s*,?\s*s\.\s*r\.\s*o\.",
+    r"\s*,?\s*s\.\s*d\.",
+    r"\s*,?\s*a\.\s*s\.",
+]
+
+# ─────────────────────────────────────────────
+#  Logging
+# ─────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("invoice_processor")
+
+# ─────────────────────────────────────────────
+#  Google API clients
+# ─────────────────────────────────────────────
+
+def build_google_clients():
+    """Build authenticated Drive and Sheets API clients from service account."""
+    creds = service_account.Credentials.from_service_account_file(
+        GOOGLE_CREDENTIALS_FILE, scopes=SCOPES
+    )
+    drive   = build("drive",   "v3", credentials=creds, cache_discovery=False)
+    sheets  = build("sheets",  "v4", credentials=creds, cache_discovery=False)
+    return drive, sheets
+
+# ─────────────────────────────────────────────
+#  Processed IDs persistence
+# ─────────────────────────────────────────────
+
+def load_processed_ids() -> set:
+    if PROCESSED_IDS_FILE.exists():
+        with open(PROCESSED_IDS_FILE) as f:
+            return set(json.load(f))
+    return set()
+
+
+def save_processed_ids(ids: set):
+    with open(PROCESSED_IDS_FILE, "w") as f:
+        json.dump(list(ids), f, indent=2)
+
+# ─────────────────────────────────────────────
+#  Google Drive helpers
+# ─────────────────────────────────────────────
+
+def list_pdfs_in_folder(drive, folder_id: str) -> list[dict]:
+    """Return list of PDF file metadata dicts in a Drive folder."""
+    query = (
+        f"'{folder_id}' in parents "
+        f"and mimeType='application/pdf' "
+        f"and trashed=false"
+    )
+    results = (
+        drive.files()
+        .list(q=query, fields="files(id, name, webViewLink)", pageSize=100)
+        .execute()
+    )
+    return results.get("files", [])
+
+
+def download_pdf(drive, file_id: str) -> bytes:
+    """Download a Drive file and return its bytes."""
+    request = drive.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buf.getvalue()
+
+
+def rename_and_move_file(drive, file_id: str, new_name: str,
+                          dest_folder_id: str, src_folder_id: str):
+    """Rename a Drive file and move it to dest_folder_id."""
+    drive.files().update(
+        fileId=file_id,
+        body={"name": new_name},
+        addParents=dest_folder_id,
+        removeParents=src_folder_id,
+        fields="id, name, parents",
+    ).execute()
+
+
+def move_file(drive, file_id: str, dest_folder_id: str, src_folder_id: str):
+    """Move a Drive file without renaming."""
+    drive.files().update(
+        fileId=file_id,
+        addParents=dest_folder_id,
+        removeParents=src_folder_id,
+        fields="id, parents",
+    ).execute()
+
+# ─────────────────────────────────────────────
+#  Google Sheets helpers
+# ─────────────────────────────────────────────
+
+DOCS_PROCESSED_HEADERS = [
+    "document_gdrive_link",
+    "document_name_original",
+    "document_name_changed",
+    "document_folder_changed",
+    "invoice_supplier_name",
+    "invoice_id",
+    "invoice_date_issued",
+    "invoice_date_due",
+    "invoice_price_total",
+    "invoice_currency",
+]
+
+INVOICE_ITEMS_HEADERS = [
+    "invoice_supplier_name",
+    "invoice_id",
+    "invoice_date_issued",
+    "invoice_date_due",
+    "invoice_price_total",
+    "invoice_currency",
+    "stay_product_name",
+    "stay_order_id",
+    "stay_client_name",
+    "stay_date_start",
+    "stay_date_end",
+    "stay_price",
+]
+
+
+def ensure_sheet_headers(sheets, spreadsheet_id: str):
+    """Create sheets and write headers if they don't exist yet."""
+    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    existing_titles = {s["properties"]["title"] for s in meta.get("sheets", [])}
+
+    requests = []
+    for title in ("DocsProcessed", "InvoiceItemsList"):
+        if title not in existing_titles:
+            requests.append({
+                "addSheet": {"properties": {"title": title}}
+            })
+
+    if requests:
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests},
+        ).execute()
+
+    # Write headers only if the sheet is empty (row 1 is blank)
+    def write_if_empty(sheet_name, headers):
+        result = (
+            sheets.spreadsheets()
+            .values()
+            .get(spreadsheetId=spreadsheet_id, range=f"{sheet_name}!A1:A1")
+            .execute()
+        )
+        if not result.get("values"):
+            sheets.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{sheet_name}!A1",
+                valueInputOption="RAW",
+                body={"values": [headers]},
+            ).execute()
+
+    write_if_empty("DocsProcessed", DOCS_PROCESSED_HEADERS)
+    write_if_empty("InvoiceItemsList", INVOICE_ITEMS_HEADERS)
+
+
+def append_row(sheets, spreadsheet_id: str, sheet_name: str, row: list):
+    sheets.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!A1",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [row]},
+    ).execute()
+
+
+def write_docs_processed(sheets, spreadsheet_id: str, data: dict,
+                          original_name: str, new_name: str,
+                          folder_label: str, gdrive_link: str):
+    row = [
+        gdrive_link,
+        original_name,
+        new_name,
+        folder_label,
+        data.get("invoice_supplier_name") or "",
+        data.get("invoice_document_id") or "",
+        data.get("invoice_date_of_issue") or "",
+        data.get("invoice_due_date") or "",
+        str(data.get("invoice_price_total") or ""),
+        data.get("invoice_currency") or "",
+    ]
+    append_row(sheets, spreadsheet_id, "DocsProcessed", row)
+
+
+def write_invoice_items(sheets, spreadsheet_id: str, data: dict):
+    line_items = data.get("line_items") or []
+    if not line_items:
+        return
+    for item in line_items:
+        row = [
+            data.get("invoice_supplier_name") or "",
+            data.get("invoice_document_id") or "",
+            data.get("invoice_date_of_issue") or "",
+            data.get("invoice_due_date") or "",
+            str(data.get("invoice_price_total") or ""),
+            data.get("invoice_currency") or "",
+            item.get("stay_product_name") or "",
+            str(item.get("stay_order_id") or ""),
+            item.get("stay_clients_name") or "",
+            item.get("stay_start_date") or "",
+            item.get("stay_end_date") or "",
+            str(item.get("stay_price") or ""),
+        ]
+        append_row(sheets, spreadsheet_id, "InvoiceItemsList", row)
+
+# ─────────────────────────────────────────────
+#  PDF text extraction
+# ─────────────────────────────────────────────
+
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    pages = []
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+    try:
+        with pdfplumber.open(tmp_path) as pdf:
+            for i, page in enumerate(pdf.pages):
+                text = page.extract_text() or ""
+                pages.append(f"--- Page {i+1} ---\n{text}")
+    finally:
+        os.unlink(tmp_path)
+    return "\n\n".join(pages)
+
+# ─────────────────────────────────────────────
+#  Gemini extraction
+# ─────────────────────────────────────────────
+
+EXTRACTION_PROMPT = """You are an expert data extraction system. Your task is to extract specified information - invoice parameters - from the provided PDF text.
+
+The invoice can be in Slovak, Czech, English or Hungarian language.
+
+Input: Text extracted from a PDF document representing a commercial invoice. If it is a multipage document, there is a chance that the document contains more than one invoice.
+
+If the invoice item list contains only 1 client = 1 item, and value of the field "stay_price" is not clear, use value of "invoice_price_total" instead.
+
+Output Format: provide ONLY the extracted data as a valid JSON object. No markdown, no code fences, no explanation — just raw JSON.
+
+INVOICE BASIC FIELDS
+
+invoice_supplier_name: name of the company issuing the invoice, labeled often as "Dodávateľ" or "Dodavatel"
+
+invoice_document_id: labeled as "Číslo faktúry" (e.g., INV-2023-001), usually in the upper right section
+
+invoice_date_of_issue: labeled as "Dátum vystavenia" (format: DD.MM.YYYY)
+
+invoice_due_date: labeled as "Dátum splatnosti" (format: DD.MM.YYYY)
+
+invoice_price_total: total sum of the invoice labeled as: Celkom, Spolu, K úhrade (output as plain number, no currency symbols)
+
+invoice_currency: one of Euro, €, CZK, Kč, HUF, Forint. Output: € for Euro/€; CZK for CZK/Kč; HUF for HUF/Forint.
+
+INVOICE ITEM FIELDS
+
+Each invoice item represents a hotel stay with or without extra services. May be in a table labeled "Príloha k faktúre".
+If more than one service is assigned to the same client, treat it as a package (one item) and use the total package price.
+
+stay_clients_name: labeled as: Meno, Jméno, Name, Priezvisko a meno, Meno a priezvisko, Jméno a příjmení, Příjmení a jméno, Hosť, Hostia
+
+stay_start_date: date DD.MM.YYYY, may be part of a period string "DD.MM - DD.MM.YYYY". Labeled as: Od, Dátum od
+
+stay_end_date: date DD.MM.YYYY, may be part of a period string. Labeled as: Do, Dátum do
+
+stay_price: total item price. Labeled as: Celkom, Spolu, Čiastka (output as plain number)
+
+stay_order_id: 7-digit number starting with 32, e.g. 3295492. Labeled as: Objednávka, Číslo objednávky
+
+stay_product_name: text. Labeled as: Pobyt, Balík
+
+AFTER EXTRACTION
+Put item fields in an array named line_items. Each element:
+{
+  "stay_clients_name": string or null,
+  "stay_start_date": string or null,
+  "stay_end_date": string or null,
+  "stay_price": number or null,
+  "stay_product_name": string or null,
+  "stay_order_id": number or null
+}
+
+INSTRUCTIONS & ERROR HANDLING:
+- If a field is not found, set its value to null.
+- All numeric values must be plain numbers (no currency symbols).
+- If the document is clearly not an invoice, return an empty JSON object {}.
+
+PDF TEXT:
+{pdf_text}
+"""
+
+
+def call_gemini(pdf_text: str) -> dict:
+    prompt = EXTRACTION_PROMPT.replace("{pdf_text}", pdf_text)
+    response = genai.GenerativeModel(GEMINI_MODEL).generate_content(prompt)
+    raw = response.text.strip()
+    # Strip accidental markdown code fences
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"```$", "", raw.strip())
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        log.error("JSON parse error: %s | Raw: %s", e, raw[:300])
+        return {}
+
+# ─────────────────────────────────────────────
+#  Filename builder
+# ─────────────────────────────────────────────
+
+def clean_supplier_name(name: str) -> str:
+    cleaned = name
+    for pattern in COMPANY_SUFFIXES:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace(",", "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def parse_date_to_yyyymmdd(date_str: str) -> str | None:
+    if not date_str:
+        return None
+    for fmt in ("%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(date_str.strip(), fmt).strftime("%Y%m%d")
+        except ValueError:
+            continue
+    return None
+
+
+def sanitize_filename(text: str) -> str:
+    return re.sub(r'[\\/*?:"<>|]', "", str(text)).strip()
+
+
+def build_new_filename(data: dict) -> str | None:
+    """FA <YYYYMMDD> <supplier_cleaned> SID <invoice_document_id>.pdf"""
+    supplier = data.get("invoice_supplier_name") or ""
+    doc_id   = data.get("invoice_document_id") or ""
+    due_date = data.get("invoice_due_date") or ""
+
+    if not supplier or not doc_id or not due_date:
+        return None
+
+    yyyymmdd = parse_date_to_yyyymmdd(due_date)
+    if not yyyymmdd:
+        return None
+
+    cleaned  = sanitize_filename(clean_supplier_name(supplier))
+    safe_id  = sanitize_filename(doc_id)
+    return f"FA {yyyymmdd} {cleaned} SID {safe_id}.pdf"
+
+
+def has_obligatory_invoice_fields(data: dict) -> bool:
+    return all(
+        data.get(f)
+        for f in (
+            "invoice_supplier_name",
+            "invoice_document_id",
+            "invoice_due_date",
+            "invoice_date_of_issue",
+            "invoice_price_total",
+            "invoice_currency",
+        )
+    )
+
+# ─────────────────────────────────────────────
+#  Core pipeline
+# ─────────────────────────────────────────────
+
+def process_file(drive, sheets, file_meta: dict):
+    """Full pipeline for a single Drive PDF file."""
+    file_id       = file_meta["id"]
+    original_name = file_meta["name"]
+    gdrive_link   = file_meta.get("webViewLink", "")
+    log.info("Processing: %s (%s)", original_name, file_id)
+
+    def move_to_errors(data=None):
+        move_file(drive, file_id, FOLDER_ERRORS, FOLDER_TO_PROCESS)
+        write_docs_processed(
+            sheets, SPREADSHEET_ID, data or {},
+            original_name, original_name, "Invoices Errors", gdrive_link,
+        )
+        log.warning("  → Moved to Errors: %s", original_name)
+
+    # 1. Download
+    try:
+        pdf_bytes = download_pdf(drive, file_id)
+    except Exception as e:
+        log.error("Download failed: %s", e)
+        move_to_errors()
+        return
+
+    # 2. Extract text
+    try:
+        pdf_text = extract_pdf_text(pdf_bytes)
+    except Exception as e:
+        log.error("PDF read failed: %s", e)
+        move_to_errors()
+        return
+
+    if not pdf_text.strip():
+        log.warning("No text in PDF — moving to Errors.")
+        move_to_errors()
+        return
+
+    # 3. Gemini extraction
+    try:
+        data = call_gemini(pdf_text)
+    except Exception as e:
+        log.error("Gemini call failed: %s", e)
+        move_to_errors()
+        return
+
+    if not data:
+        log.warning("Not an invoice — moving to Errors.")
+        move_to_errors()
+        return
+
+    # 4. Build new filename (checks rename-obligatory fields)
+    new_filename = build_new_filename(data)
+    if not new_filename:
+        log.warning("Missing rename-obligatory fields — moving to Errors.")
+        move_to_errors(data)
+        return
+
+    # 5. Check full invoice data
+    has_full_data = has_obligatory_invoice_fields(data)
+
+    # 6. Rename + move to Extracted
+    try:
+        rename_and_move_file(drive, file_id, new_filename,
+                             FOLDER_EXTRACTED, FOLDER_TO_PROCESS)
+        log.info("  → Renamed & moved: %s", new_filename)
+    except Exception as e:
+        log.error("Drive move failed: %s", e)
+
+    # 7. Write DocsProcessed
+    write_docs_processed(
+        sheets, SPREADSHEET_ID, data,
+        original_name, new_filename, "Invoices Extracted", gdrive_link,
+    )
+
+    # 8. Write InvoiceItemsList (only if full data present)
+    if has_full_data:
+        write_invoice_items(sheets, SPREADSHEET_ID, data)
+        log.info("  → %d line item(s) written to InvoiceItemsList.",
+                 len(data.get("line_items") or []))
+    else:
+        log.warning("  → Missing full invoice fields — InvoiceItemsList skipped.")
+
+    log.info("  Done: %s", original_name)
+
+# ─────────────────────────────────────────────
+#  Main loop
+# ─────────────────────────────────────────────
+
+def main():
+    # Preflight checks
+    if GEMINI_API_KEY in ("YOUR_API_KEY_HERE", ""):
+        log.error("GEMINI_API_KEY not set. Copy .env.example to .env and add your key.")
+        return
+    if SPREADSHEET_ID == "YOUR_SPREADSHEET_ID_HERE":
+        log.error("SPREADSHEET_ID not set in .env.")
+        return
+    if not Path(GOOGLE_CREDENTIALS_FILE).exists():
+        log.error("credentials.json not found. See SETUP.md.")
+        return
+
+    genai.configure(api_key=GEMINI_API_KEY)
+
+    try:
+        drive, sheets = build_google_clients()
+    except Exception as e:
+        log.error("Failed to build Google API clients: %s", e)
+        return
+
+    # Ensure spreadsheet has correct sheets + headers
+    try:
+        ensure_sheet_headers(sheets, SPREADSHEET_ID)
+    except Exception as e:
+        log.error("Spreadsheet setup failed: %s", e)
+        return
+
+    processed_ids = load_processed_ids()
+
+    log.info("Invoice Processor started.")
+    log.info("  Polling folder : %s  (every %ds)", FOLDER_TO_PROCESS, POLL_INTERVAL)
+    log.info("  Spreadsheet   : %s", SPREADSHEET_ID)
+
+    while True:
+        try:
+            files = list_pdfs_in_folder(drive, FOLDER_TO_PROCESS)
+            new_files = [f for f in files if f["id"] not in processed_ids]
+
+            if new_files:
+                log.info("Found %d new PDF(s).", len(new_files))
+                for file_meta in new_files:
+                    try:
+                        process_file(drive, sheets, file_meta)
+                    except Exception as e:
+                        log.error("Unhandled error for '%s': %s",
+                                  file_meta.get("name"), e)
+                    finally:
+                        # Mark as processed regardless of outcome
+                        processed_ids.add(file_meta["id"])
+                        save_processed_ids(processed_ids)
+            else:
+                log.debug("No new files. Sleeping %ds…", POLL_INTERVAL)
+
+        except Exception as e:
+            log.error("Poll error: %s", e)
+
+        time.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
