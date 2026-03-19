@@ -29,3 +29,13 @@ Skript som pre Vás testoval na 10 PDF súboroch, ktoré boli dodané na pohovor
 
 Skript ešte potrebuje dopracovanie, pretože sa objavujú falošné presuny do `Errors` (false positives).
 Pravdepodobne bude potrebné doladiť prompt alebo zmeniť model; počas testu sa používal Gemini Flash 2.5.
+
+## Aktualizácia 19.03.2026 (changelog)
+
+- Zjednotené názvy extrahovaných polí podľa požadovanej schémy, vrátane mapovania starších aliasov.
+- Sprísnená validácia výstupu z LLM: oddelené kontroly pre premenovanie dokumentu a pre zápis položiek do tabuľky.
+- Doplnené robustnejšie spracovanie čísel, dátumov a mien dodávateľov pre konzistentné premenovanie súborov.
+- Upravená logika presunov dokumentov (Extracted / Errors / Quarantine) s jasnejším dôvodom rozhodnutia.
+- Rozšírené logovanie do `DocsProcessed` o stav spracovania, čas a chybový dôvod pre lepšiu auditovateľnosť.
+- Posilnená idempotencia spracovania dokumentov (detekcia zmenených súborov podľa metadát).
+- Pripravený workflow pre uzatvorenie faktúr (Invoices Closed) cez interné číslo z tabuľky.
