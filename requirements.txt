@@ -4,3 +4,8 @@ google-api-python-client
 google-generativeai
 pdfplumber
 python-dotenv
+
+# OCR fallback dependencies — also requires system package: tesseract-ocr
+# See SETUP.md for installation instructions
+pytesseract>=0.3.10
+pdf2image>=1.16.3

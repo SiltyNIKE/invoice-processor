@@ -24,6 +24,7 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 import io
 
@@ -98,6 +99,9 @@ FULL_INVOICE_REQUIRED_FIELDS = (
     "invoice_price_total",
     "invoice_currency",
 )
+
+# Canonical invoice filename pattern according to specification.
+NAME_PATTERN = "FA_{date_due_YYYYMMDD}_{supplier_cleaned}_SID_{invoice_id}"
 
 # ─────────────────────────────────────────────
 #  Logging
@@ -237,10 +241,6 @@ def update_processed_state(file_meta: dict, processed_state: dict[str, dict[str,
 # ─────────────────────────────────────────────
 
 DOCS_PROCESSED_HEADERS = [
-    "processed_at",
-    "status",
-    "error_reason",
-    "internal_number",
     "document_gdrive_link",
     "document_name_original",
     "document_name_changed",
@@ -251,20 +251,24 @@ DOCS_PROCESSED_HEADERS = [
     "invoice_date_due",
     "invoice_price_total",
     "invoice_currency",
+    "processed_at",
+    "status",
+    "error_reason",
+    "internal_number",
 ]
 
 INVOICE_ITEMS_HEADERS = [
     "invoice_supplier_name",
     "invoice_id",
-    "invoice_date_issued",
     "invoice_date_due",
+    "invoice_date_issued",
     "invoice_price_total",
     "invoice_currency",
     "stay_product_name",
     "stay_order_id",
-    "stay_client_name",
-    "stay_date_start",
-    "stay_date_end",
+    "stay_clients_name",
+    "stay_start_date",
+    "stay_end_date",
     "stay_price",
 ]
 
@@ -330,10 +334,6 @@ def write_docs_processed(sheets, spreadsheet_id: str, data: dict,
                           status: str, error_reason: str = "",
                           internal_number: str = ""):
     row = [
-        datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        status,
-        error_reason,
-        internal_number,
         gdrive_link,
         original_name,
         new_name,
@@ -344,6 +344,10 @@ def write_docs_processed(sheets, spreadsheet_id: str, data: dict,
         data.get("invoice_date_due") or "",
         str(data.get("invoice_price_total") or ""),
         data.get("invoice_currency") or "",
+        datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        status,
+        error_reason,
+        internal_number,
     ]
     append_row(sheets, spreadsheet_id, "DocsProcessed", row)
 
@@ -362,15 +366,15 @@ def write_invoice_items(sheets, spreadsheet_id: str, data: dict):
         row = [
             data.get("invoice_supplier_name") or "",
             data.get("invoice_id") or "",
-            data.get("invoice_date_issued") or "",
             data.get("invoice_date_due") or "",
+            data.get("invoice_date_issued") or "",
             str(data.get("invoice_price_total") or ""),
             data.get("invoice_currency") or "",
             item.get("stay_product_name") or "",
             str(item.get("stay_order_id") or ""),
-            item.get("stay_client_name") or "",
-            item.get("stay_date_start") or "",
-            item.get("stay_date_end") or "",
+            item.get("stay_clients_name") or "",
+            item.get("stay_start_date") or "",
+            item.get("stay_end_date") or "",
             str(item.get("stay_price") or ""),
         ]
         append_row(sheets, spreadsheet_id, "InvoiceItemsList", row)
@@ -422,9 +426,30 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
             for i, page in enumerate(pdf.pages):
                 text = page.extract_text() or ""
                 pages.append(f"--- Page {i+1} ---\n{text}")
+                
+        extracted_text = "\n\n".join(pages).strip()
+        
+        # Fallback to OCR if text layer is empty (e.g., scanned PDF)
+        if not re.sub(r'--- Page \d+ ---', '', extracted_text).strip():
+            log.info("PDF text layer is empty, attempting OCR fallback...")
+            try:
+                import pytesseract
+                from pdf2image import convert_from_path
+                images = convert_from_path(tmp_path)
+                ocr_pages = []
+                for i, image in enumerate(images):
+                    text = pytesseract.image_to_string(image, lang='slk+ces+eng+hun')
+                    ocr_pages.append(f"--- Page {i+1} ---\n{text}")
+                extracted_text = "\n\n".join(ocr_pages)
+                log.info("OCR fallback completed successfully.")
+            except ImportError:
+                log.warning("OCR fallback failed: pytesseract or pdf2image not installed.")
+            except Exception as e:
+                log.error("OCR fallback encountered an error: %s", e)
+                
     finally:
         os.unlink(tmp_path)
-    return "\n\n".join(pages)
+    return extracted_text.strip()
 
 # ─────────────────────────────────────────────
 #  Gemini extraction
@@ -474,9 +499,9 @@ stay_product_name: text. Labeled as: Pobyt, Balík
 AFTER EXTRACTION
 Put item fields in an array named line_items. Each element:
 {
-    "stay_client_name": string or null,
-    "stay_date_start": string or null,
-    "stay_date_end": string or null,
+        "stay_clients_name": string or null,
+        "stay_start_date": string or null,
+        "stay_end_date": string or null,
   "stay_price": number or null,
   "stay_product_name": string or null,
   "stay_order_id": number or null
@@ -485,7 +510,7 @@ Put item fields in an array named line_items. Each element:
 INSTRUCTIONS & ERROR HANDLING:
 - If a field is not found, set its value to null.
 - All numeric values must be plain numbers (no currency symbols).
-- If the document is clearly not an invoice, return an empty JSON object {}.
+- If the document is clearly not an invoice, return an empty JSON object {} and include an "explanation" key describing why.
 
 PDF TEXT:
 {pdf_text}
@@ -501,16 +526,16 @@ REPAIR_PROMPT = """Return ONLY valid JSON matching exactly this schema:
   "invoice_currency": "€"|"CZK"|"HUF"|null,
   "line_items": [
     {
-      "stay_client_name": string|null,
-      "stay_date_start": "DD.MM.YYYY"|null,
-      "stay_date_end": "DD.MM.YYYY"|null,
+            "stay_clients_name": string|null,
+            "stay_start_date": "DD.MM.YYYY"|null,
+            "stay_end_date": "DD.MM.YYYY"|null,
       "stay_price": number|null,
       "stay_product_name": string|null,
       "stay_order_id": number|null
     }
   ]
 }
-If clearly not invoice, return {}.
+If clearly not invoice, return {} and include an "explanation" key describing why.
 
 PDF TEXT:
 {pdf_text}
@@ -602,13 +627,13 @@ def normalize_line_item(item: dict, fallback_year: int | None) -> dict:
             stay_order_id = int(digits)
 
     return {
-        "stay_client_name": _get_alias(item, "stay_client_name", "stay_clients_name"),
-        "stay_date_start": normalize_date(
-            _get_alias(item, "stay_date_start", "stay_start_date"),
+        "stay_clients_name": _get_alias(item, "stay_clients_name", "stay_client_name"),
+        "stay_start_date": normalize_date(
+            _get_alias(item, "stay_start_date", "stay_date_start"),
             fallback_year,
         ),
-        "stay_date_end": normalize_date(
-            _get_alias(item, "stay_date_end", "stay_end_date"),
+        "stay_end_date": normalize_date(
+            _get_alias(item, "stay_end_date", "stay_date_end"),
             fallback_year,
         ),
         "stay_price": stay_price,
@@ -676,9 +701,9 @@ def extraction_looks_suspicious(data: dict) -> bool:
         return True
     if items and all(
         not any(item.get(field) for field in (
-            "stay_client_name",
-            "stay_date_start",
-            "stay_date_end",
+            "stay_clients_name",
+            "stay_start_date",
+            "stay_end_date",
             "stay_price",
             "stay_product_name",
             "stay_order_id",
@@ -750,7 +775,7 @@ def clean_supplier_name(name: str) -> str:
 def parse_date_to_yyyymmdd(date_str: str) -> str | None:
     if not date_str:
         return None
-    for fmt in ("%d.%m.%Y", "%d.%m.%y"):
+    for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"):
         try:
             return datetime.strptime(date_str.strip(), fmt).strftime("%Y%m%d")
         except ValueError:
@@ -763,7 +788,7 @@ def sanitize_filename(text: str) -> str:
 
 
 def build_new_filename(data: dict) -> str | None:
-    """FA_<YYYYMMDD>_<supplier_cleaned>_SID_<invoice_id>.pdf"""
+    """Uses NAME_PATTERN for standard invoice renaming."""
     supplier = data.get("invoice_supplier_name") or ""
     doc_id   = data.get("invoice_id") or ""
     due_date = data.get("invoice_date_due") or ""
@@ -775,9 +800,13 @@ def build_new_filename(data: dict) -> str | None:
     if not yyyymmdd:
         return None
 
-    cleaned  = sanitize_filename(clean_supplier_name(supplier)).replace(" ", "-")
+    cleaned  = sanitize_filename(clean_supplier_name(supplier)).replace(" ", "_")
     safe_id  = sanitize_filename(doc_id)
-    return f"FA_{yyyymmdd}_{cleaned}_SID_{safe_id}.pdf"
+    return NAME_PATTERN.format(
+        date_due_YYYYMMDD=yyyymmdd,
+        supplier_cleaned=cleaned,
+        invoice_id=safe_id,
+    ) + ".pdf"
 
 
 def has_obligatory_invoice_fields(data: dict) -> bool:
@@ -800,154 +829,180 @@ def process_file(drive, sheets, file_meta: dict, invoice_registry: dict[str, dic
     original_name = file_meta["name"]
     gdrive_link   = file_meta.get("webViewLink", "")
     log.info("Processing: %s (%s)", original_name, file_id)
+    data: dict = {}
+    new_name = original_name
+    folder_label = "Invoices Errors"
+    status = "ERROR"
+    error_reason = "UNEXPECTED_ERROR"
+    internal_number = ""
+    route_finalized = False
 
-    def move_with_log(dest_folder_id: str, folder_label: str, status: str,
-                      error_reason: str, data: dict | None = None,
-                      changed_name: str | None = None):
-        move_file(drive, file_id, dest_folder_id, FOLDER_TO_PROCESS)
-        write_docs_processed(
-            sheets,
-            SPREADSHEET_ID,
-            data or {},
-            original_name,
-            changed_name or original_name,
-            folder_label,
-            gdrive_link,
-            status=status,
-            error_reason=error_reason,
-        )
-        log.warning("  → Moved to %s: %s | reason=%s", folder_label, original_name, error_reason)
-
-    def move_to_errors(data=None, reason=""):
-        move_with_log(
-            dest_folder_id=FOLDER_ERRORS,
-            folder_label="Invoices Errors",
-            status="ERROR",
-            error_reason=reason,
-            data=data,
-        )
-
-    def move_to_quarantine(data=None, reason=""):
-        folder_id = FOLDER_QUARANTINE or FOLDER_ERRORS
-        label = "Invoices Quarantine" if FOLDER_QUARANTINE else "Invoices Errors"
-        move_with_log(
-            dest_folder_id=folder_id,
-            folder_label=label,
-            status="QUARANTINED",
-            error_reason=reason,
-            data=data,
-        )
-
-    # 1. Download
     try:
-        pdf_bytes = download_pdf(drive, file_id)
+        try:
+            pdf_bytes = download_pdf(drive, file_id)
+        except HttpError as e:
+            error_reason = "DOWNLOAD_FAILED"
+            log.error("Drive API error during download for %s: %s", original_name, e)
+            raise
+
+        try:
+            pdf_text = extract_pdf_text(pdf_bytes)
+        except Exception as e:
+            error_reason = "PDF_READ_FAILED"
+            log.error("PDF read error for %s: %s", original_name, e)
+            raise
+
+        if not pdf_text.strip():
+            error_reason = "EMPTY_PDF_TEXT"
+            move_file(drive, file_id, FOLDER_ERRORS, FOLDER_TO_PROCESS)
+            folder_label = "Invoices Errors"
+            status = "ERROR"
+            route_finalized = True
+
+        if not route_finalized and likely_multi_invoice(pdf_text):
+            folder_id = FOLDER_QUARANTINE or FOLDER_ERRORS
+            folder_label = "Invoices Quarantine" if FOLDER_QUARANTINE else "Invoices Errors"
+            error_reason = "MULTI_INVOICE_UNSUPPORTED"
+            move_file(drive, file_id, folder_id, FOLDER_TO_PROCESS)
+            status = "QUARANTINED"
+            route_finalized = True
+
+        if not route_finalized:
+            try:
+                raw_data, gemini_error = call_gemini(pdf_text)
+            except Exception as e:
+                error_reason = "GEMINI_CALL_FAILED"
+                log.error("LLM API error for %s: %s", original_name, e)
+                raise
+
+            if gemini_error:
+                folder_id = FOLDER_QUARANTINE or FOLDER_ERRORS
+                folder_label = "Invoices Quarantine" if FOLDER_QUARANTINE else "Invoices Errors"
+                error_reason = gemini_error
+                move_file(drive, file_id, folder_id, FOLDER_TO_PROCESS)
+                status = "QUARANTINED"
+                route_finalized = True
+
+        if not route_finalized:
+            if not raw_data:
+                data = {}
+                error_reason = "NOT_AN_INVOICE"
+                move_file(drive, file_id, FOLDER_ERRORS, FOLDER_TO_PROCESS)
+                folder_label = "Invoices Errors"
+                status = "ERROR"
+                route_finalized = True
+            else:
+                data = normalize_extraction(raw_data)
+
+        if not route_finalized and extraction_looks_suspicious(data):
+            folder_id = FOLDER_QUARANTINE or FOLDER_ERRORS
+            folder_label = "Invoices Quarantine" if FOLDER_QUARANTINE else "Invoices Errors"
+            error_reason = "SUSPICIOUS_EXTRACTION"
+            move_file(drive, file_id, folder_id, FOLDER_TO_PROCESS)
+            status = "QUARANTINED"
+            route_finalized = True
+
+        if not route_finalized:
+            rename_missing = missing_required_fields(data, RENAME_REQUIRED_FIELDS)
+            has_rename_fields = len(rename_missing) == 0
+
+            if not has_rename_fields:
+                error_reason = f"MISSING_RENAME_FIELDS:{','.join(rename_missing)}"
+                move_file(drive, file_id, FOLDER_ERRORS, FOLDER_TO_PROCESS)
+                folder_label = "Invoices Errors"
+                status = "ERROR"
+                route_finalized = True
+            else:
+                new_filename = build_new_filename(data)
+                if not new_filename:
+                    error_reason = "INVALID_RENAME_FIELDS"
+                    move_file(drive, file_id, FOLDER_ERRORS, FOLDER_TO_PROCESS)
+                    folder_label = "Invoices Errors"
+                    status = "ERROR"
+                    route_finalized = True
+                else:
+                    new_name = new_filename
+                    has_invoice_fields = has_obligatory_invoice_fields(data)
+                    missing_full_fields = missing_required_fields(data, FULL_INVOICE_REQUIRED_FIELDS)
+
+                    rename_and_move_file(
+                        drive,
+                        file_id,
+                        new_filename,
+                        FOLDER_EXTRACTED,
+                        FOLDER_TO_PROCESS,
+                    )
+                    folder_label = "Invoices Extracted"
+
+                    if has_invoice_fields:
+                        try:
+                            write_invoice_items(sheets, SPREADSHEET_ID, data)
+                        except HttpError as e:
+                            error_reason = "SHEETS_WRITE_FAILED"
+                            status = "ERROR"
+                            log.error("Sheets API error while writing items for %s: %s", original_name, e)
+                        else:
+                            status = "EXTRACTED"
+                            error_reason = ""
+                            log.info("  → %d line item(s) written to InvoiceItemsList.",
+                                     len(data.get("line_items") or []))
+                    else:
+                        status = "RENAME_ONLY"
+                        error_reason = "MISSING_FULL_DATA"
+                        log.warning(
+                            "  → Missing full invoice fields — rename-only branch: %s",
+                            ",".join(missing_full_fields),
+                        )
+
+                    invoice_id = str(data.get("invoice_id") or "").strip()
+                    if invoice_id:
+                        invoice_registry[invoice_id] = {
+                            "file_id": file_id,
+                            "name": new_filename,
+                            "folder": "extracted",
+                            "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                        }
+
+                    route_finalized = True
+
+    except HttpError as e:
+        log.error("Drive/Sheets API error for %s (%s): %s", original_name, type(e).__name__, e)
+        if not route_finalized:
+            try:
+                move_file(drive, file_id, FOLDER_ERRORS, FOLDER_TO_PROCESS)
+                folder_label = "Invoices Errors"
+            except Exception as move_error:
+                log.error("Fallback move to Errors failed for %s: %s", original_name, move_error)
+            status = "ERROR"
+            if not error_reason:
+                error_reason = "API_ERROR"
     except Exception as e:
-        log.error("Download failed: %s", e)
-        move_to_errors(reason="DOWNLOAD_FAILED")
-        return
-
-    # 2. Extract text
-    try:
-        pdf_text = extract_pdf_text(pdf_bytes)
-    except Exception as e:
-        log.error("PDF read failed: %s", e)
-        move_to_errors(reason="PDF_READ_FAILED")
-        return
-
-    if not pdf_text.strip():
-        log.warning("No text in PDF — moving to Errors.")
-        move_to_errors(reason="EMPTY_PDF_TEXT")
-        return
-
-    if likely_multi_invoice(pdf_text):
-        log.warning("Possible multi-invoice document — moving to Quarantine.")
-        move_to_quarantine(reason="MULTI_INVOICE_UNSUPPORTED")
-        return
-
-    # 3. Gemini extraction
-    try:
-        raw_data, gemini_error = call_gemini(pdf_text)
-    except Exception as e:
-        log.error("Gemini call failed: %s", e)
-        move_to_errors(reason="GEMINI_CALL_FAILED")
-        return
-
-    if gemini_error:
-        move_to_quarantine(reason=gemini_error)
-        return
-
-    if not raw_data:
-        log.warning("Not an invoice — moving to Errors.")
-        move_to_errors(reason="NOT_AN_INVOICE")
-        return
-
-    data = normalize_extraction(raw_data)
-
-    if extraction_looks_suspicious(data):
-        log.warning("Suspicious extraction output — moving to Quarantine.")
-        move_to_quarantine(data=data, reason="SUSPICIOUS_EXTRACTION")
-        return
-
-    if all(data.get(k) is None for k in ("invoice_supplier_name", "invoice_id", "invoice_date_due")):
-        log.warning("Not an invoice — moving to Errors.")
-        move_to_errors(data=data, reason="NOT_AN_INVOICE")
-        return
-
-    # 4. Build new filename (checks rename-obligatory fields)
-    missing_for_rename = missing_required_fields(data, RENAME_REQUIRED_FIELDS)
-    if missing_for_rename:
-        reason = f"MISSING_RENAME_FIELDS:{','.join(missing_for_rename)}"
-        log.warning("Missing rename-obligatory fields — moving to Errors.")
-        move_to_errors(data=data, reason=reason)
-        return
-
-    new_filename = build_new_filename(data)
-    if not new_filename:
-        log.warning("Missing rename-obligatory fields — moving to Errors.")
-        move_to_errors(data=data, reason="INVALID_RENAME_FIELDS")
-        return
-
-    # 5. Check full invoice data
-    has_full_data = has_obligatory_invoice_fields(data)
-    missing_full_fields = missing_required_fields(data, FULL_INVOICE_REQUIRED_FIELDS)
-
-    # 6. Rename + move to Extracted
-    try:
-        rename_and_move_file(drive, file_id, new_filename,
-                             FOLDER_EXTRACTED, FOLDER_TO_PROCESS)
-        log.info("  → Renamed & moved: %s", new_filename)
-    except Exception as e:
-        log.error("Drive move failed: %s", e)
-        move_to_errors(data=data, reason="DRIVE_RENAME_MOVE_FAILED")
-        return
-
-    invoice_id = str(data.get("invoice_id") or "").strip()
-    if invoice_id:
-        invoice_registry[invoice_id] = {
-            "file_id": file_id,
-            "name": new_filename,
-            "folder": "extracted",
-            "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        }
-
-    # 7. Write DocsProcessed
-    write_docs_processed(
-        sheets, SPREADSHEET_ID, data,
-        original_name, new_filename, "Invoices Extracted", gdrive_link,
-        status="EXTRACTED",
-        error_reason="",
-    )
-
-    # 8. Write InvoiceItemsList (only if full data present)
-    if has_full_data:
-        write_invoice_items(sheets, SPREADSHEET_ID, data)
-        log.info("  → %d line item(s) written to InvoiceItemsList.",
-                 len(data.get("line_items") or []))
-    else:
-        log.warning(
-            "  → Missing full invoice fields — InvoiceItemsList skipped: %s",
-            ",".join(missing_full_fields),
-        )
+        log.error("Unexpected processing error for %s (%s): %s", original_name, type(e).__name__, e)
+        if not route_finalized:
+            try:
+                move_file(drive, file_id, FOLDER_ERRORS, FOLDER_TO_PROCESS)
+                folder_label = "Invoices Errors"
+            except Exception as move_error:
+                log.error("Fallback move to Errors failed for %s: %s", original_name, move_error)
+            status = "ERROR"
+            if not error_reason:
+                error_reason = "UNEXPECTED_ERROR"
+    finally:
+        try:
+            write_docs_processed(
+                sheets,
+                SPREADSHEET_ID,
+                data,
+                original_name,
+                new_name,
+                folder_label,
+                gdrive_link,
+                status=status,
+                error_reason=error_reason,
+                internal_number=internal_number,
+            )
+        except Exception as e:
+            log.error("DocsProcessed write failed for %s (%s): %s", original_name, type(e).__name__, e)
 
     log.info("  Done: %s", original_name)
 
